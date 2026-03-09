@@ -1,0 +1,16 @@
+services:           # list of containers to run
+  api:              # name of your service (can be anything)
+    build:
+      context: .          # look for Dockerfile in current folder
+      dockerfile: Dockerfile  # use this specific file
+    ports:
+      - "3000:3000"   # host:container (your machine : inside docker)
+    environment:
+      - PORT=3000       # env vars passed into the container
+      - APP_VERSION=local
+    restart: unless-stopped  # auto-restart if it crashes
+    healthcheck:             # periodically check if app is alive
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s    # check every 30 seconds
+      timeout: 5s      # fail if no response in 5s
+      retries: 3       # mark unhealthy after 3 failures
