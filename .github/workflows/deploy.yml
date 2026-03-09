@@ -8,7 +8,7 @@ on:
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: node-ecr-api
-  ECS_CLUSTER: node-api-cluster
+  ECS_CLUSTER: ecs-fargate-cluster1
   ECS_SERVICE: node-api-service
   TASK_DEFINITION: task-definition.json
   CONTAINER_NAME: node-api
@@ -67,7 +67,25 @@ jobs:
             --region $AWS_REGION
           echo "✅ ECR repository ready"
 
-      # 5. Build & push Docker image
+      # 5. Create ECS cluster if not exists
+      - name: Create ECS cluster if not exists
+        run: |
+          CLUSTER_STATUS=$(aws ecs describe-clusters \
+            --clusters $ECS_CLUSTER \
+            --region $AWS_REGION \
+            --query "clusters[0].status" \
+            --output text 2>/dev/null)
+
+          if [ "$CLUSTER_STATUS" != "ACTIVE" ]; then
+            aws ecs create-cluster \
+              --cluster-name $ECS_CLUSTER \
+              --region $AWS_REGION
+            echo "✅ ECS cluster '$ECS_CLUSTER' created"
+          else
+            echo "✅ ECS cluster '$ECS_CLUSTER' already exists"
+          fi
+
+      # 6. Build & push Docker image
       - name: Build, tag, and push image to ECR
         id: build-image
         env:
@@ -82,7 +100,7 @@ jobs:
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "✅ Image pushed: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
-      # 6. Update image in task definition
+      # 7. Update image in task definition
       - name: Update ECS task definition with new image
         id: task-def
         uses: aws-actions/amazon-ecs-render-task-definition@v1
@@ -91,14 +109,14 @@ jobs:
           container-name: ${{ env.CONTAINER_NAME }}
           image: ${{ steps.build-image.outputs.image }}
 
-      # 7. Deploy to ECS Fargate
+      # 8. Deploy to ECS Fargate
       - name: Deploy to ECS Fargate
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
           task-definition: ${{ steps.task-def.outputs.task-definition }}
           service: ${{ env.ECS_SERVICE }}
           cluster: ${{ env.ECS_CLUSTER }}
-          wait-for-service-stability: true   # waits until deploy is healthy
+          wait-for-service-stability: true
 
       - name: Print deploy success
         run: echo "🚀 Deployed successfully to ECS Fargate!"
