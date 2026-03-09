@@ -10,8 +10,8 @@ env:
   ECR_REPOSITORY: node-ecr-api
   ECS_CLUSTER: ecs-fargate-cluster1
   ECS_SERVICE: node-api-service
-  TASK_DEFINITION: task-definition.json
   CONTAINER_NAME: node-api
+  TASK_FAMILY: node-api-task
 
 jobs:
   test:
@@ -51,12 +51,43 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # 3. Login to ECR
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+      # 3. Get AWS account ID
+      - name: Get AWS Account ID
+        id: account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+          echo "✅ Account ID: $ACCOUNT_ID"
 
-      # 4. Create ECR repo if not exists
+      # 4. Create ECS service-linked role if not exists
+      - name: Create ECS service-linked role if not exists
+        run: |
+          aws iam get-role --role-name AWSServiceRoleForECS 2>/dev/null || \
+          aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com
+          echo "✅ AWSServiceRoleForECS ready"
+
+      # 5. Create ecsTaskExecutionRole if not exists
+      - name: Create ECS task execution role if not exists
+        run: |
+          aws iam get-role --role-name ecsTaskExecutionRole 2>/dev/null || \
+          (
+            aws iam create-role \
+              --role-name ecsTaskExecutionRole \
+              --assume-role-policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [{
+                  "Effect": "Allow",
+                  "Principal": { "Service": "ecs-tasks.amazonaws.com" },
+                  "Action": "sts:AssumeRole"
+                }]
+              }' && \
+            aws iam attach-role-policy \
+              --role-name ecsTaskExecutionRole \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+          )
+          echo "✅ ecsTaskExecutionRole ready"
+
+      # 6. Create ECR repo if not exists
       - name: Create ECR repository if not exists
         run: |
           aws ecr describe-repositories \
@@ -67,7 +98,7 @@ jobs:
             --region $AWS_REGION
           echo "✅ ECR repository ready"
 
-      # 5. Create ECS cluster if not exists
+      # 7. Create ECS cluster if not exists
       - name: Create ECS cluster if not exists
         run: |
           CLUSTER_STATUS=$(aws ecs describe-clusters \
@@ -79,13 +110,27 @@ jobs:
           if [ "$CLUSTER_STATUS" != "ACTIVE" ]; then
             aws ecs create-cluster \
               --cluster-name $ECS_CLUSTER \
+              --capacity-providers FARGATE \
               --region $AWS_REGION
-            echo "✅ ECS cluster '$ECS_CLUSTER' created"
+            echo "✅ ECS cluster created"
           else
-            echo "✅ ECS cluster '$ECS_CLUSTER' already exists"
+            echo "✅ ECS cluster already exists"
           fi
 
-      # 6. Build & push Docker image
+      # 8. Create CloudWatch log group if not exists
+      - name: Create CloudWatch log group if not exists
+        run: |
+          aws logs create-log-group \
+            --log-group-name /ecs/node-api \
+            --region $AWS_REGION 2>/dev/null || true
+          echo "✅ CloudWatch log group ready"
+
+      # 9. Login to ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 10. Build & push Docker image
       - name: Build, tag, and push image to ECR
         id: build-image
         env:
@@ -98,25 +143,117 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "✅ Image pushed: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "✅ Image pushed"
 
-      # 7. Update image in task definition
-      - name: Update ECS task definition with new image
+      # 11. Register ECS task definition dynamically (no static file needed)
+      - name: Register ECS task definition
         id: task-def
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: ${{ env.TASK_DEFINITION }}
-          container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ steps.build-image.outputs.image }}
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          ACCOUNT_ID: ${{ steps.account.outputs.id }}
+        run: |
+          cat > /tmp/task-def.json <<EOF
+          {
+            "family": "$TASK_FAMILY",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "256",
+            "memory": "512",
+            "executionRoleArn": "arn:aws:iam::$ACCOUNT_ID:role/ecsTaskExecutionRole",
+            "containerDefinitions": [
+              {
+                "name": "$CONTAINER_NAME",
+                "image": "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG",
+                "portMappings": [
+                  {
+                    "containerPort": 3000,
+                    "protocol": "tcp"
+                  }
+                ],
+                "essential": true,
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/node-api",
+                    "awslogs-region": "$AWS_REGION",
+                    "awslogs-stream-prefix": "ecs"
+                  }
+                },
+                "healthCheck": {
+                  "command": ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"],
+                  "interval": 30,
+                  "timeout": 5,
+                  "retries": 3,
+                  "startPeriod": 10
+                }
+              }
+            ]
+          }
+          EOF
 
-      # 8. Deploy to ECS Fargate
-      - name: Deploy to ECS Fargate
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
-        with:
-          task-definition: ${{ steps.task-def.outputs.task-definition }}
-          service: ${{ env.ECS_SERVICE }}
-          cluster: ${{ env.ECS_CLUSTER }}
-          wait-for-service-stability: true
+          TASK_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/task-def.json \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
 
-      - name: Print deploy success
-        run: echo "🚀 Deployed successfully to ECS Fargate!"
+          echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
+          echo "✅ Task definition registered: $TASK_ARN"
+
+      # 12. Create ECS service if not exists, else update it
+      - name: Create or update ECS service
+        env:
+          TASK_ARN: ${{ steps.task-def.outputs.task_arn }}
+        run: |
+          SERVICE_STATUS=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --region $AWS_REGION \
+            --query "services[0].status" \
+            --output text 2>/dev/null)
+
+          if [ "$SERVICE_STATUS" == "ACTIVE" ]; then
+            # Service exists — update it
+            aws ecs update-service \
+              --cluster $ECS_CLUSTER \
+              --service $ECS_SERVICE \
+              --task-definition $TASK_ARN \
+              --region $AWS_REGION
+            echo "✅ ECS service updated"
+          else
+            # Get default VPC and subnets
+            VPC_ID=$(aws ec2 describe-vpcs \
+              --filters "Name=isDefault,Values=true" \
+              --query "Vpcs[0].VpcId" \
+              --output text)
+
+            SUBNET_IDS=$(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query "Subnets[*].SubnetId" \
+              --output text | tr '\t' ',')
+
+            SG_ID=$(aws ec2 describe-security-groups \
+              --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=default" \
+              --query "SecurityGroups[0].GroupId" \
+              --output text)
+
+            # Create service
+            aws ecs create-service \
+              --cluster $ECS_CLUSTER \
+              --service-name $ECS_SERVICE \
+              --task-definition $TASK_ARN \
+              --desired-count 1 \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],securityGroups=[$SG_ID],assignPublicIp=ENABLED}" \
+              --region $AWS_REGION
+            echo "✅ ECS service created"
+          fi
+
+      # 13. Wait for service to stabilize
+      - name: Wait for deployment to complete
+        run: |
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --region $AWS_REGION
+          echo "🚀 Deployed successfully to ECS Fargate!"
