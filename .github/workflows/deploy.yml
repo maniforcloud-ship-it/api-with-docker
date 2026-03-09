@@ -1,8 +1,8 @@
-name: CD - Deploy to AWS ECS Fargate
+name: Deploy - Deploy to AWS ECS Fargate
 
 on:
   workflow_run:
-    workflows: ["CI - Run Tests"]   # runs only after CI passes
+    workflows: ["Build - Build & Push to ECR"]
     types:
       - completed
     branches:
@@ -18,16 +18,14 @@ env:
 
 jobs:
   deploy:
-    name: Build & Deploy to Fargate
+    name: Deploy to Fargate
     runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}  # only deploy if CI passed
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
-      # 1. Checkout
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. Configure AWS credentials
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -35,7 +33,6 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # 3. Get AWS account ID
       - name: Get AWS Account ID
         id: account
         run: |
@@ -43,14 +40,12 @@ jobs:
           echo "id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
           echo "✅ Account ID: $ACCOUNT_ID"
 
-      # 4. Create ECS service-linked role if not exists
       - name: Create ECS service-linked role if not exists
         run: |
           aws iam get-role --role-name AWSServiceRoleForECS > /dev/null 2>&1 || \
           aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com > /dev/null 2>&1 || true
           echo "✅ AWSServiceRoleForECS ready"
 
-      # 5. Create ecsTaskExecutionRole if not exists
       - name: Create ECS task execution role if not exists
         run: |
           aws iam get-role --role-name ecsTaskExecutionRole 2>/dev/null || \
@@ -71,18 +66,6 @@ jobs:
           )
           echo "✅ ecsTaskExecutionRole ready"
 
-      # 6. Create ECR repo if not exists
-      - name: Create ECR repository if not exists
-        run: |
-          aws ecr describe-repositories \
-            --repository-names $ECR_REPOSITORY \
-            --region $AWS_REGION 2>/dev/null || \
-          aws ecr create-repository \
-            --repository-name $ECR_REPOSITORY \
-            --region $AWS_REGION
-          echo "✅ ECR repository ready"
-
-      # 7. Create ECS cluster if not exists
       - name: Create ECS cluster if not exists
         run: |
           CLUSTER_STATUS=$(aws ecs describe-clusters \
@@ -92,7 +75,7 @@ jobs:
             --output text 2>/dev/null)
 
           if [ "$CLUSTER_STATUS" == "ACTIVE" ]; then
-            echo "✅ ECS cluster already exists and is ACTIVE"
+            echo "✅ ECS cluster already ACTIVE"
           else
             if [ "$CLUSTER_STATUS" == "INACTIVE" ]; then
               aws ecs delete-cluster --cluster $ECS_CLUSTER --region $AWS_REGION
@@ -113,12 +96,10 @@ jobs:
                 echo "✅ ECS cluster is ACTIVE"
                 break
               fi
-              echo "  Status: $STATUS, retrying in 5s..."
               sleep 5
             done
           fi
 
-      # 8. Create CloudWatch log group if not exists
       - name: Create CloudWatch log group if not exists
         run: |
           aws logs create-log-group \
@@ -126,27 +107,10 @@ jobs:
             --region $AWS_REGION 2>/dev/null || true
           echo "✅ CloudWatch log group ready"
 
-      # 9. Login to ECR
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # 10. Build & push Docker image
-      - name: Build, tag, and push image to ECR
-        id: build-image
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
-                     $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "✅ Image pushed"
-
-      # 11. Register ECS task definition dynamically
       - name: Register ECS task definition
         id: task-def
         env:
@@ -199,7 +163,6 @@ jobs:
           echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
           echo "✅ Task definition registered: $TASK_ARN"
 
-      # 12. Create or update ECS service
       - name: Create or update ECS service
         env:
           TASK_ARN: ${{ steps.task-def.outputs.task_arn }}
@@ -242,7 +205,6 @@ jobs:
             echo "✅ ECS service created"
           fi
 
-      # 13. Wait for service to stabilize
       - name: Wait for deployment to complete
         run: |
           aws ecs wait services-stable \
