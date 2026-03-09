@@ -1,7 +1,10 @@
-name: Build and Deploy to AWS ECS Fargate
+name: CD - Deploy to AWS ECS Fargate
 
 on:
-  push:
+  workflow_run:
+    workflows: ["CI - Run Tests"]   # runs only after CI passes
+    types:
+      - completed
     branches:
       - main
 
@@ -14,29 +17,10 @@ env:
   TASK_FAMILY: node-api-task
 
 jobs:
-  test:
-    name: Run Tests
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: "npm"
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run tests
-        run: npm test
-
   deploy:
     name: Build & Deploy to Fargate
     runs-on: ubuntu-latest
-    needs: test
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}  # only deploy if CI passed
 
     steps:
       # 1. Checkout
@@ -62,7 +46,8 @@ jobs:
       # 4. Create ECS service-linked role if not exists
       - name: Create ECS service-linked role if not exists
         run: |
-          aws iam get-role --role-name AWSServiceRoleForECS > /dev/null 2>&1 ||           aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com > /dev/null 2>&1 || true
+          aws iam get-role --role-name AWSServiceRoleForECS > /dev/null 2>&1 || \
+          aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com > /dev/null 2>&1 || true
           echo "✅ AWSServiceRoleForECS ready"
 
       # 5. Create ecsTaskExecutionRole if not exists
@@ -106,14 +91,31 @@ jobs:
             --query "clusters[0].status" \
             --output text 2>/dev/null)
 
-          if [ "$CLUSTER_STATUS" != "ACTIVE" ]; then
+          if [ "$CLUSTER_STATUS" == "ACTIVE" ]; then
+            echo "✅ ECS cluster already exists and is ACTIVE"
+          else
+            if [ "$CLUSTER_STATUS" == "INACTIVE" ]; then
+              aws ecs delete-cluster --cluster $ECS_CLUSTER --region $AWS_REGION
+              echo "🗑️ Deleted inactive cluster"
+            fi
             aws ecs create-cluster \
               --cluster-name $ECS_CLUSTER \
               --capacity-providers FARGATE \
+              --default-capacity-provider-strategy capacityProvider=FARGATE,weight=1 \
               --region $AWS_REGION
-            echo "✅ ECS cluster created"
-          else
-            echo "✅ ECS cluster already exists"
+            echo "⏳ Waiting for cluster to become ACTIVE..."
+            for i in $(seq 1 10); do
+              STATUS=$(aws ecs describe-clusters \
+                --clusters $ECS_CLUSTER \
+                --query "clusters[0].status" \
+                --output text)
+              if [ "$STATUS" == "ACTIVE" ]; then
+                echo "✅ ECS cluster is ACTIVE"
+                break
+              fi
+              echo "  Status: $STATUS, retrying in 5s..."
+              sleep 5
+            done
           fi
 
       # 8. Create CloudWatch log group if not exists
@@ -144,7 +146,7 @@ jobs:
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "✅ Image pushed"
 
-      # 11. Register ECS task definition dynamically (no static file needed)
+      # 11. Register ECS task definition dynamically
       - name: Register ECS task definition
         id: task-def
         env:
@@ -190,16 +192,14 @@ jobs:
             ]
           }
           EOF
-
           TASK_ARN=$(aws ecs register-task-definition \
             --cli-input-json file:///tmp/task-def.json \
             --query "taskDefinition.taskDefinitionArn" \
             --output text)
-
           echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
           echo "✅ Task definition registered: $TASK_ARN"
 
-      # 12. Create ECS service if not exists, else update it
+      # 12. Create or update ECS service
       - name: Create or update ECS service
         env:
           TASK_ARN: ${{ steps.task-def.outputs.task_arn }}
@@ -212,7 +212,6 @@ jobs:
             --output text 2>/dev/null)
 
           if [ "$SERVICE_STATUS" == "ACTIVE" ]; then
-            # Service exists — update it
             aws ecs update-service \
               --cluster $ECS_CLUSTER \
               --service $ECS_SERVICE \
@@ -220,23 +219,18 @@ jobs:
               --region $AWS_REGION
             echo "✅ ECS service updated"
           else
-            # Get default VPC and subnets
             VPC_ID=$(aws ec2 describe-vpcs \
               --filters "Name=isDefault,Values=true" \
               --query "Vpcs[0].VpcId" \
               --output text)
-
             SUBNET_IDS=$(aws ec2 describe-subnets \
               --filters "Name=vpc-id,Values=$VPC_ID" \
               --query "Subnets[*].SubnetId" \
               --output text | tr '\t' ',')
-
             SG_ID=$(aws ec2 describe-security-groups \
               --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=default" \
               --query "SecurityGroups[0].GroupId" \
               --output text)
-
-            # Create service
             aws ecs create-service \
               --cluster $ECS_CLUSTER \
               --service-name $ECS_SERVICE \
