@@ -62,8 +62,7 @@ jobs:
       # 4. Create ECS service-linked role if not exists
       - name: Create ECS service-linked role if not exists
         run: |
-          aws iam get-role --role-name AWSServiceRoleForECS 2>/dev/null || \
-          aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com
+          aws iam get-role --role-name AWSServiceRoleForECS > /dev/null 2>&1 ||           aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com > /dev/null 2>&1 || true
           echo "✅ AWSServiceRoleForECS ready"
 
       # 5. Create ecsTaskExecutionRole if not exists
